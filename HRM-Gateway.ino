@@ -13,7 +13,7 @@ IPAddress WS_HOST(192, 168, 1, 22);
 #define WS_PATH "/ws/hrm"
 #define HRM_NAME_PREFIX "Fitcent_CL830"
 
-#define UPPER_BPM_THRESHOLD 200
+#define UPPER_BPM_THRESHOLD 124
 #define SAMPLES_BEFORE_ALERT 5
 #define MUTE_DURATION_MS 600000
 #define MAX_BUFFERED_EVENTS 50
@@ -23,13 +23,22 @@ WebSocketsClient webSocket;
 bool wsConnected = false;
 
 BLEScan* pBLEScan;
-BLEClient* pClient;
+BLEClient* pClient = nullptr;
 BLERemoteCharacteristic* pHRMChar = nullptr;
 
 bool mute = false;
 unsigned long muteStart = 0;
 int highCount = 0;
 std::vector<uint8_t> bpmBuffer;
+
+// BLE reconnect logic
+bool bleConnected = false;
+bool bleNeedReconnect = false;
+unsigned long lastBLEReconnect = 0;
+const unsigned long BLEReconnectInterval = 5000;
+
+// Forward declaration
+void scanAndConnectHRM();
 
 void connectWiFi() {
   Serial.printf("Connecting to %s...\n", WIFI_SSID);
@@ -104,9 +113,24 @@ void onHRMNotify(BLERemoteCharacteristic* pChar, uint8_t* data, size_t length, b
   sendBPM(bpm);
 }
 
+// BLE disconnect callback
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) override {
+    // Optional: actions when connected
+  }
+  void onDisconnect(BLEClient* pclient) override {
+    Serial.println("❌ BLE device disconnected");
+    bleConnected = false;
+    bleNeedReconnect = true;
+    lastBLEReconnect = millis();
+  }
+};
+
 bool connectToDevice(BLEAdvertisedDevice device) {
   Serial.printf("🔗 Connecting to %s...\n", device.getAddress().toString().c_str());
   pClient = BLEDevice::createClient();
+  pClient->setClientCallbacks(new MyClientCallback());
+
   if (!pClient->connect(&device)) {
     Serial.println("❌ Failed to connect");
     return false;
@@ -115,6 +139,7 @@ bool connectToDevice(BLEAdvertisedDevice device) {
   BLERemoteService* pService = pClient->getService("180D");
   if (!pService) {
     Serial.println("❌ HRM service not found");
+    pClient->disconnect();
     return false;
   }
 
@@ -122,10 +147,12 @@ bool connectToDevice(BLEAdvertisedDevice device) {
   if (pHRMChar && pHRMChar->canNotify()) {
     pHRMChar->registerForNotify(onHRMNotify);
     Serial.println("✅ Subscribed to HRM characteristic");
+    bleConnected = true;
     return true;
   }
 
   Serial.println("❌ HRM characteristic not found or can't notify");
+  pClient->disconnect();
   return false;
 }
 
@@ -167,10 +194,18 @@ void setup() {
 void loop() {
   webSocket.loop();
 
-  static unsigned long lastReconnect = 0;
-  if (!webSocket.isConnected() && millis() - lastReconnect > 5000) {
+  static unsigned long lastWSReconnect = 0;
+  if (!webSocket.isConnected() && millis() - lastWSReconnect > 5000) {
     connectWebSocket();
-    lastReconnect = millis();
+    lastWSReconnect = millis();
+  }
+
+  // BLE reconnect logic
+  if (!bleConnected && bleNeedReconnect && millis() - lastBLEReconnect > BLEReconnectInterval) {
+    Serial.println("🔄 Attempting to reconnect to HRM...");
+    scanAndConnectHRM();
+    bleNeedReconnect = false; // Will be set true again by callback if disconnects
+    lastBLEReconnect = millis();
   }
 
   delay(10);
